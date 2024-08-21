@@ -1,0 +1,1448 @@
+---
+title: "Measuring the Effect of AI Deepfake Videos on Favorabilities of Public Figures"
+author: "Woojae Chung, Nicole Kan, Joan Lee, Ricky Pang, Mohammad Kanawati"
+date: "08/14/2024"
+output:
+  pdf_document: default
+  word_document: default
+---
+
+```{r load packages, message = FALSE}
+library(knitr)
+library(data.table)
+library(dplyr)
+library(fastDummies)
+library(lmtest)
+library(sandwich)
+library(lmtest)
+library(ggplot2) 
+library(patchwork)
+library(stringr)
+library(stargazer)
+```
+
+```{r global options, include = FALSE}
+knitr::opts_chunk$set(include = TRUE, message = FALSE, warning = FALSE, tidy = TRUE, tidy.opts=list(width.cutoff=80))
+
+knitr::knit_engines$set(problem_description = function(options) {
+  code <- paste(options$code, collapse = "\n")
+})
+
+```
+
+# Load Data 
+
+```{r load data}
+# File Path
+# Uncomment the line for your specific file path / file name
+
+# Ricky:
+#filepath <-'~/downloads/241 - Project_July 29, 2024_18.19.csv'
+# Woojae: 
+filepath <- '241 - Project_July 30, 2024_10.53.csv'
+# Nicole:
+#filepath <- '241 - Project Data.csv'
+
+# Load Data
+d <- fread(filepath)
+```
+
+# Data Cleaning
+
+```{r data cleaning}
+# Drop first two rows (parsing issue)
+d <- d[-c(1, 2), ]
+
+# Drop unneeded columns 
+columns_to_drop <- c(
+  'StartDate','EndDate','Status','IPAddress','Progress','Finished','RecordedDate',
+  'RecipientLastName','RecipientFirstName','RecipientEmail','ExternalReference',
+  'LocationLatitude','LocationLongitude','DistributionChannel','UserLanguage', 'transaction_id'
+  # 'Duration (in seconds)'
+  )
+
+d <- d[ , !names(d) %in% columns_to_drop, with = FALSE]
+
+# Duration column as numeric
+d[, `Duration (in seconds)` := as.numeric(`Duration (in seconds)`)]
+
+# Remove terminated (not familiar with all individuals tested)
+d <- d[!(
+  grepl("NOT", d$fam_biden) | 
+  grepl("NOT", d$fam_trump) | 
+  grepl("NOT", d$fam_zuck) | 
+  grepl("NOT", d$fam_musk)
+), ]
+
+# Rename demographic questions
+d <- d %>%
+  rename(
+    gender = Q1,
+    age = Q2,
+    party = Q3,
+    ideology = Q4,
+    industry = Q5
+  )
+
+# Define the columns to check for numerical value - this tells us whether they are in control or not
+control_columns <- c("fav_biden_1", "fav_trump_1", "fav_zuck_1", "fav_musk_1")
+treatment1_columns<-c("t1_biden_1", "t1_trump_1", "t1_zuck_1", "t1_musk_1")
+treatment2_columns<-c("t2_biden_1", "t2_trump_1", "t2_zuck_1", "t2_musk_1")
+
+# Create a new column that returns 1 if there is a numerical value in the range 0 to 10 in any of the specified columns
+is_in_range <- function(x) {
+  vals <- as.numeric(x)
+  !is.na(vals) & vals >= 0 & vals <= 10
+}
+
+d$control <- as.numeric(rowSums(sapply(d[, ..control_columns], is_in_range)) > 0)
+d$treatment1 <- as.numeric(rowSums(sapply(d[, ..treatment1_columns], is_in_range)) > 0)
+d$treatment2 <- as.numeric(rowSums(sapply(d[, ..treatment2_columns], is_in_range)) > 0)
+
+# Rename the columns (to fix survey mistake)
+setnames(d, old = c("treatment1", "treatment2"), new = c("temp", "treatment1"))
+setnames(d, old = "temp", new = "treatment2")
+
+# Single treatment column (used for certain functions like covariate balance test)
+d <- d %>%
+  mutate(treatment_group = case_when(
+    control == 1 ~ "Control",
+    treatment1 == 1 ~ "Treatment1",
+    treatment2 == 1 ~ "Treatment2",
+    TRUE ~ NA_character_  # Handle any unexpected cases
+  ))
+
+# Group age
+d$age <- as.numeric(d$age)
+d$age_group <- cut(d$age, breaks = c(18, 35, 50, 65, Inf), labels = c('18-34', '35-49', '50-64', '65+'), right = FALSE)
+
+# Group industry (tech vs not)
+d[, industry_tech := ifelse(industry == "Technology ", "Technology", "Others")]
+
+# For releveling regression control for party
+d$party <- factor(d$party, levels = c("Democrat", "Republican", "Independent", "Decline to answer"))
+```
+
+```{r add average favorability scores}
+# Favorability columns
+fav_cols <- c(
+  "fav_biden_1", "fav_trump_1", "fav_zuck_1", "fav_musk_1", 
+  "t1_biden_1", "t1_trump_1", "t1_zuck_1", "t1_musk_1", 
+  "t2_biden_1", "t2_trump_1", "t2_zuck_1", "t2_musk_1"
+)
+
+# Average of all columns 
+d[, (fav_cols) := lapply(.SD, as.numeric), .SDcols = fav_cols]
+d$avg_fav <- rowMeans(d[ , ..fav_cols], na.rm=TRUE)
+
+# Add average for each individual
+fav_cols <- c(
+  "fav_biden_1", "fav_trump_1", "fav_zuck_1", "fav_musk_1", 
+  "t1_biden_1", "t1_trump_1", "t1_zuck_1", "t1_musk_1", 
+  "t2_biden_1", "t2_trump_1", "t2_zuck_1", "t2_musk_1"
+)
+fav_cols_biden <- c("fav_biden_1", "t1_biden_1", "t2_biden_1")
+fav_cols_trump <- c("fav_trump_1", "t1_trump_1", "t2_trump_1")
+fav_cols_zuck <- c("fav_zuck_1", "t1_zuck_1", "t2_zuck_1")
+fav_cols_musk <- c("fav_musk_1", "t1_musk_1", "t2_musk_1")
+
+d$avg_fav_biden <- rowMeans(d[ , ..fav_cols_biden], na.rm=TRUE)
+d$avg_fav_trump <- rowMeans(d[ , ..fav_cols_trump], na.rm=TRUE)
+d$avg_fav_zuck <- rowMeans(d[ , ..fav_cols_zuck], na.rm=TRUE)
+d$avg_fav_musk <- rowMeans(d[ , ..fav_cols_musk], na.rm=TRUE)
+```
+
+```{r check data}
+# Cleaned file shape
+cat("Number of rows in filtered data:", nrow(d), "\n")
+cat("Number of columns in filtered data:", ncol(d), "\n")
+
+# Observations for each group
+control_count <- sum(d$control)
+treatment1_count <- sum(d$treatment1)
+treatment2_count <- sum(d$treatment2)
+
+cat("Control group observations:", control_count, "\n")
+cat("Treatment 1 group observations:", treatment1_count, "\n")
+cat("Treatment 2 group observations:", treatment2_count, "\n")
+```
+
+# Analysis 
+
+## EDA
+
+### Covariate Balance Check
+
+```{r distribution of demographics all, fig.width = 14, fig.height = 8}
+# gender
+gender_counts <- d %>%
+  count(gender) %>%
+  mutate(percentage = n / sum(n))
+
+dist_gender <- ggplot(gender_counts, aes(x = str_wrap(gender, width = 12), y = n)) + 
+  geom_bar(stat = "identity", color = "black") + 
+  geom_text(aes(label = paste(n, " (", scales::percent(percentage, accuracy = 0.1), ")", sep = "")), vjust = 1.5, color = "white") +
+  labs(title = "Gender", x = "Gender", y = "Number of Sample") +
+  theme_minimal() 
+
+    
+# age
+dist_age <- ggplot(d, aes(x = age)) + 
+  geom_histogram(color = 'black', binwidth = 10, position = position_dodge(width = 0.5)) + 
+  labs(title = "Age", x = "Age") +
+  theme_minimal() +
+  theme(axis.title.y = element_blank())
+
+# age_group
+age_group_counts <- d %>%
+  count(age_group) %>%
+  mutate(percentage = n / sum(n))
+
+dist_age_group <- ggplot(age_group_counts, aes(x = age_group, y = n)) + 
+  geom_bar(stat = "identity", color = "black") + 
+  geom_text(aes(label = paste(n, " (", scales::percent(percentage, accuracy = 0.1), ")", sep = "")), vjust = 1.5, color = "white") +
+  labs(title = "Age Group", x = "Age Group") +
+  theme_minimal() +
+  theme(axis.title.y = element_blank())
+
+# party
+party_counts <- d %>%
+  count(party) %>%
+  mutate(percentage = n / sum(n))
+
+party_colors <- c("Republican" = "red", "Democrat" = "blue", "Independent" = "grey", "Other" = "purple")
+
+dist_party <- ggplot(party_counts, aes(x = party, y = n, fill = party)) + 
+  geom_bar(stat = "identity", color = "black") + 
+  geom_text(aes(label = paste(n, " (", scales::percent(percentage, accuracy = 0.1), ")", sep = "")), vjust = 1.5, color = "white") +
+  scale_fill_manual(values = party_colors) +
+  labs(title = "Political Party", x = "Party", y = "Number of Sample") +
+  theme_minimal() +
+  theme(legend.position = "none") 
+
+# ideology
+ideology_counts <- d %>%
+  count(ideology) %>%
+  mutate(percentage = n / sum(n))
+
+ideology_colors <- c("Conservative" = "lightcoral", "Liberal" = "lightblue", "Neither liberal nor conservative" = "grey", "Decline to answer" = "black")
+
+dist_ideology <- ggplot(ideology_counts, aes(x = str_wrap(ideology, width = 12), y = n, fill = ideology)) + 
+  geom_bar(stat = "identity", color = "black") + 
+  geom_text(aes(label = paste(n, " (", scales::percent(percentage, accuracy = 0.1), ")", sep = "")), vjust = 1.5, color = "white") +
+  scale_fill_manual(values = ideology_colors) +
+  labs(title = "Political Ideology", x = "Ideology") +
+  theme_minimal() +
+  theme(legend.position = "none", axis.title.y = element_blank())  
+
+# industry
+industry_counts <- d %>%
+  count(industry_tech) %>%
+  mutate(percentage = n / sum(n))
+
+# Plot with labels
+dist_tech <- ggplot(industry_counts, aes(x = industry_tech, y = n)) + 
+  geom_bar(stat = "identity", color = "black") + 
+  geom_text(aes(label = paste(n, " (", scales::percent(percentage, accuracy = 0.1), ")", sep = "")), vjust = 1.5, color = "white") +
+  labs(title = "Job Industry", x = "Industry") +
+  theme_minimal()  +
+  theme(axis.title.y = element_blank())
+
+# Patchwork into one plot 
+demo_dist <- ((dist_gender + dist_age + dist_age_group) / (dist_party + dist_ideology + dist_tech)) + 
+  plot_annotation(title = "Distribution of Variables")
+
+demo_dist
+```
+
+```{r chi square test for covariate balance}
+chi_square_test <- function(variable) {
+  contingency_table <- table(d[[variable]], d$treatment_group) # Use the single treatment variable here
+  test_result <- chisq.test(contingency_table)
+  return(test_result$p.value)
+}
+
+variables <- c("gender", "age_group", "party", "ideology", "industry_tech")
+chi_square_results <- lapply(variables, chi_square_test)
+
+names(chi_square_results) <- variables
+chi_square_results
+
+# For table of p-values in kable
+p_values <- sapply(variables, chi_square_test)
+p_values_df <- data.frame(p_Value = p_values)
+
+p_values_df %>%
+  mutate(p_Value = round(p_Value, 3)) %>%
+  kable(caption = "p-values for Covariate Balance Across Treatment Groups", col.names = "p-Value")
+
+p_values_df
+```
+
+
+### Favorability Distributions
+
+```{r distributions of favorability, fig.width = 12, fig.height = 4}
+# avg_fav
+dist_avg_fav <- ggplot(d, aes(x = avg_fav)) +
+  geom_histogram(binwidth = 1, fill = "grey", color = "black") +
+  labs(title = "All", x = "Favorability", y = "Sample") +
+  theme_minimal() +
+  ylim(0, 100) +
+  scale_x_continuous(breaks = seq(0, 10, 1)) +
+  theme(plot.title = element_text(hjust = 0.5))
+
+# avg_fav_biden
+dist_avg_fav_biden <- ggplot(d, aes(x = avg_fav_biden)) +
+  geom_histogram(binwidth = 1, fill = "blue", color = "black") +
+  labs(title = "Biden", x = "Favorability") +
+  theme_minimal() +
+  ylim(0, 100) +
+  scale_x_continuous(breaks = seq(0, 10, 1)) +
+  theme(plot.title = element_text(hjust = 0.5), axis.title.y = element_blank())
+
+# avg_fav_trump
+dist_avg_fav_trump <- ggplot(d, aes(x = avg_fav_trump)) +
+  geom_histogram(binwidth = 1, fill = "red", color = "black") +
+  labs(title = "Trump", x = "Favorability") +
+  theme_minimal() +
+  ylim(0, 100) +
+  scale_x_continuous(breaks = seq(0, 10, 1)) +
+  theme(plot.title = element_text(hjust = 0.5), axis.title.y = element_blank())
+
+# avg_fav_zuck
+dist_avg_fav_zuck <- ggplot(d, aes(x = avg_fav_zuck)) +
+  geom_histogram(binwidth = 1, fill = "lightgreen", color = "black") +
+  labs(title = "Zuckerberg", x = "Favorability") +
+  theme_minimal() +
+  ylim(0, 100) +
+  scale_x_continuous(breaks = seq(0, 10, 1)) +
+  theme(plot.title = element_text(hjust = 0.5), axis.title.y = element_blank())
+
+# avg_fav_musk
+dist_avg_fav_musk <- ggplot(d, aes(x = avg_fav_musk)) +
+  geom_histogram(binwidth = 1, fill = "lightgoldenrod", color = "black") +
+  labs(title = "Musk", x = "Favorability") +
+  theme_minimal() +
+  ylim(0, 100) +
+  scale_x_continuous(breaks = seq(0, 10, 1)) +
+  theme(plot.title = element_text(hjust = 0.5), axis.title.y = element_blank())
+
+# Patchwork into one plot
+fav_dist <- dist_avg_fav + dist_avg_fav_biden + dist_avg_fav_trump + dist_avg_fav_zuck + dist_avg_fav_musk +
+  plot_layout(ncol = 5) +
+  plot_annotation(title = "Distribution of Favorability")
+
+print(fav_dist)
+```
+
+```{r distributions for dem}
+# Democrats
+# avg_fav
+dem_dist_avg_fav <- ggplot(d[party=="Democrat"], aes(x = avg_fav)) +
+  geom_histogram(binwidth = 1, fill = "grey", color = "black") +
+  labs(title = "All", x = "Favorability", y = "Sample") +
+  theme_minimal() +
+  ylim(0, 70) +
+  scale_x_continuous(breaks = seq(0, 10, 1), limits = c(0, 10)) +
+  theme(plot.title = element_text(hjust = 0.5))
+
+# avg_fav_biden
+dem_dist_avg_fav_biden <- ggplot(d[party=="Democrat"], aes(x = avg_fav_biden)) +
+  geom_histogram(binwidth = 1, fill = "blue", color = "black") +
+  labs(title = "Biden", x = "Favorability") +
+  theme_minimal() +
+  ylim(0, 70) +
+  scale_x_continuous(breaks = seq(0, 10, 1)) +
+  theme(plot.title = element_text(hjust = 0.5), axis.title.y = element_blank())
+
+# avg_fav_trump
+dem_dist_avg_fav_trump <- ggplot(d[party=="Democrat"], aes(x = avg_fav_trump)) +
+  geom_histogram(binwidth = 1, fill = "red", color = "black") +
+  labs(title = "Trump", x = "Favorability") +
+  theme_minimal() +
+  ylim(0, 70) +
+  scale_x_continuous(breaks = seq(0, 10, 1)) +
+  theme(plot.title = element_text(hjust = 0.5), axis.title.y = element_blank())
+
+# Patchwork into one plot
+dem_fav_dist <- dem_dist_avg_fav + dem_dist_avg_fav_biden + dem_dist_avg_fav_trump +
+  plot_layout(ncol = 3) +
+  plot_annotation(title = "Distribution of Favorability - Democrats")
+
+print(dem_fav_dist)
+```
+
+```{r distributions for rep}
+# Republicans
+# avg_fav
+rep_dist_avg_fav <- ggplot(d[party=="Republican"], aes(x = avg_fav)) +
+  geom_histogram(binwidth = 1, fill = "grey", color = "black") +
+  labs(title = "All", x = "Favorability", y = "Sample") +
+  theme_minimal() +
+  ylim(0, 70) +
+  scale_x_continuous(breaks = seq(0, 10, 1)) +
+  theme(plot.title = element_text(hjust = 0.5))
+
+# avg_fav_biden
+rep_dist_avg_fav_biden <- ggplot(d[party=="Republican"], aes(x = avg_fav_biden)) +
+  geom_histogram(binwidth = 1, fill = "blue", color = "black") +
+  labs(title = "Biden", x = "Favorability") +
+  theme_minimal() +
+  ylim(0, 70) +
+  scale_x_continuous(breaks = seq(0, 10, 1)) +
+  theme(plot.title = element_text(hjust = 0.5), axis.title.y = element_blank())
+
+# avg_fav_trump
+rep_dist_avg_fav_trump <- ggplot(d[party=="Republican"], aes(x = avg_fav_trump)) +
+  geom_histogram(binwidth = 1, fill = "red", color = "black") +
+  labs(title = "Trump", x = "Favorability") +
+  theme_minimal() +
+  ylim(0, 70) +
+  scale_x_continuous(breaks = seq(0, 10, 1)) +
+  theme(plot.title = element_text(hjust = 0.5), axis.title.y = element_blank())
+
+# Patchwork into one plot
+rep_fav_dist <- rep_dist_avg_fav + rep_dist_avg_fav_biden + rep_dist_avg_fav_trump +
+  plot_layout(ncol = 3) + 
+  plot_annotation(title = "Distribution of Favorability - Republicans")
+
+print(rep_fav_dist)
+```
+
+```{r distributions for dem + rep, fig.width = 12, fig.height = 3}
+party_fav_dist <- (dem_fav_dist | rep_fav_dist) +
+  plot_annotation(title = "Distribution of Favorability for Democrats (Left 3) and Republicans (Right 3)")
+print(party_fav_dist)
+```
+
+```{r distributions of favorability for all treatment groups, fig.width = 12, fig.height = 8}
+# Average lines
+c_mean_avg_fav <- mean(d[control==1]$avg_fav, na.rm = TRUE)
+c_mean_avg_fav_biden <- mean(d[control==1]$avg_fav_biden, na.rm = TRUE)
+c_mean_avg_fav_trump <- mean(d[control==1]$avg_fav_trump, na.rm = TRUE)
+c_mean_avg_fav_zuck <- mean(d[control==1]$avg_fav_zuck, na.rm = TRUE)
+c_mean_avg_fav_musk <- mean(d[control==1]$avg_fav_musk, na.rm = TRUE)
+
+t1_mean_avg_fav <- mean(d[treatment1==1]$avg_fav, na.rm = TRUE)
+t1_mean_avg_fav_biden <- mean(d[treatment1==1]$avg_fav_biden, na.rm = TRUE)
+t1_mean_avg_fav_trump <- mean(d[treatment1==1]$avg_fav_trump, na.rm = TRUE)
+t1_mean_avg_fav_zuck <- mean(d[treatment1==1]$avg_fav_zuck, na.rm = TRUE)
+t1_mean_avg_fav_musk <- mean(d[treatment1==1]$avg_fav_musk, na.rm = TRUE)
+
+t2_mean_avg_fav <- mean(d[treatment2==1]$avg_fav, na.rm = TRUE)
+t2_mean_avg_fav_biden <- mean(d[treatment2==1]$avg_fav_biden, na.rm = TRUE)
+t2_mean_avg_fav_trump <- mean(d[treatment2==1]$avg_fav_trump, na.rm = TRUE)
+t2_mean_avg_fav_zuck <- mean(d[treatment2==1]$avg_fav_zuck, na.rm = TRUE)
+t2_mean_avg_fav_musk <- mean(d[treatment2==1]$avg_fav_musk, na.rm = TRUE)
+
+# Control
+# avg_fav
+c_dist_avg_fav <- ggplot(d[control==1], aes(x = avg_fav)) +
+  geom_histogram(binwidth = 1, fill = "grey", color = "black") +
+  geom_vline(aes(xintercept = c_mean_avg_fav), color = "orange", linetype = "dashed", linewidth = 1) +
+  labs(title = "All", x = "Favorability", y = "Sample") +
+  theme_minimal() +
+  ylim(0, 50) +
+  scale_x_continuous(breaks = seq(0, 10, 1)) +
+  theme(plot.title = element_text(hjust = 0.5))
+
+# avg_fav_biden
+c_dist_avg_fav_biden <- ggplot(d[control==1], aes(x = avg_fav_biden)) +
+  geom_histogram(binwidth = 1, fill = "blue", color = "black") +
+  geom_vline(aes(xintercept = c_mean_avg_fav), color = "orange", linetype = "dashed", linewidth = 1) +
+  labs(title = "Biden", x = "Favorability") +
+  theme_minimal() +
+  ylim(0, 40) +
+  scale_x_continuous(breaks = seq(0, 10, 1)) +
+  theme(plot.title = element_text(hjust = 0.5), axis.title.y = element_blank())
+
+# avg_fav_trump
+c_dist_avg_fav_trump <- ggplot(d[control==1], aes(x = avg_fav_trump)) +
+  geom_histogram(binwidth = 1, fill = "red", color = "black") +
+  geom_vline(aes(xintercept = c_mean_avg_fav), color = "orange", linetype = "dashed", linewidth = 1) +
+  labs(title = "Trump", x = "Favorability") +
+  theme_minimal() +
+  ylim(0, 40) +
+  scale_x_continuous(breaks = seq(0, 10, 1)) +
+  theme(plot.title = element_text(hjust = 0.5), axis.title.y = element_blank())
+
+# avg_fav_zuck
+c_dist_avg_fav_zuck <- ggplot(d[control==1], aes(x = avg_fav_zuck)) +
+  geom_histogram(binwidth = 1, fill = "lightgreen", color = "black") +
+  geom_vline(aes(xintercept = c_mean_avg_fav), color = "orange", linetype = "dashed", linewidth = 1) +
+  labs(title = "Zuckerberg", x = "Favorability") +
+  theme_minimal() +
+  ylim(0, 40) +
+  scale_x_continuous(breaks = seq(0, 10, 1)) +
+  theme(plot.title = element_text(hjust = 0.5), axis.title.y = element_blank())
+
+# avg_fav_musk
+c_dist_avg_fav_musk <- ggplot(d[control==1], aes(x = avg_fav_musk)) +
+  geom_histogram(binwidth = 1, fill = "lightgoldenrod", color = "black") +
+  geom_vline(aes(xintercept = c_mean_avg_fav), color = "orange", linetype = "dashed", linewidth = 1) +
+  labs(title = "Musk", x = "Favorability") +
+  theme_minimal() +
+  ylim(0, 40) +
+  scale_x_continuous(breaks = seq(0, 10, 1)) +
+  theme(plot.title = element_text(hjust = 0.5), axis.title.y = element_blank())
+
+# Patchwork into one plot
+c_fav_dist <- c_dist_avg_fav + c_dist_avg_fav_biden + c_dist_avg_fav_trump + c_dist_avg_fav_zuck + c_dist_avg_fav_musk +
+  plot_layout(ncol = 5) +
+  plot_annotation(title = "Distribution of Favorability - Control")
+
+
+# Treatment 1
+# avg_fav
+t1_dist_avg_fav <- ggplot(d[treatment1==1], aes(x = avg_fav)) +
+  geom_histogram(binwidth = 1, fill = "grey", color = "black") +
+  geom_vline(aes(xintercept = t1_mean_avg_fav), color = "orange", linetype = "dashed", linewidth = 1) +
+  labs(title = "All", x = "Favorability", y = "Sample") +
+  theme_minimal() +
+  ylim(0, 50) +
+  scale_x_continuous(breaks = seq(0, 10, 1), limits = c(0, 10)) +
+  theme(plot.title = element_text(hjust = 0.5))
+
+# avg_fav_biden
+t1_dist_avg_fav_biden <- ggplot(d[treatment1==1], aes(x = avg_fav_biden)) +
+  geom_histogram(binwidth = 1, fill = "blue", color = "black") +
+  geom_vline(aes(xintercept = t1_mean_avg_fav), color = "orange", linetype = "dashed", linewidth = 1) +
+  labs(title = "Biden", x = "Favorability") +
+  theme_minimal() +
+  ylim(0, 40) +
+  scale_x_continuous(breaks = seq(0, 10, 1)) +
+  theme(plot.title = element_text(hjust = 0.5), axis.title.y = element_blank())
+
+# avg_fav_trump
+t1_dist_avg_fav_trump <- ggplot(d[treatment1==1], aes(x = avg_fav_trump)) +
+  geom_histogram(binwidth = 1, fill = "red", color = "black") +
+  geom_vline(aes(xintercept = t1_mean_avg_fav), color = "orange", linetype = "dashed", linewidth = 1) +
+  labs(title = "Trump", x = "Favorability") +
+  theme_minimal() +
+  ylim(0, 40) +
+  scale_x_continuous(breaks = seq(0, 10, 1)) +
+  theme(plot.title = element_text(hjust = 0.5), axis.title.y = element_blank())
+
+# avg_fav_zuck
+t1_dist_avg_fav_zuck <- ggplot(d[treatment1==1], aes(x = avg_fav_zuck)) +
+  geom_histogram(binwidth = 1, fill = "lightgreen", color = "black") +
+  geom_vline(aes(xintercept = t1_mean_avg_fav), color = "orange", linetype = "dashed", linewidth = 1) +
+  labs(title = "Zuckerberg", x = "Favorability") +
+  theme_minimal() +
+  ylim(0, 40) +
+  scale_x_continuous(breaks = seq(0, 10, 1)) +
+  theme(plot.title = element_text(hjust = 0.5), axis.title.y = element_blank())
+
+# avg_fav_musk
+t1_dist_avg_fav_musk <- ggplot(d[treatment1==1], aes(x = avg_fav_musk)) +
+  geom_histogram(binwidth = 1, fill = "lightgoldenrod", color = "black") +
+  geom_vline(aes(xintercept = t1_mean_avg_fav), color = "orange", linetype = "dashed", linewidth = 1) +
+  labs(title = "Musk", x = "Favorability") +
+  theme_minimal() +
+  ylim(0, 40) +
+  scale_x_continuous(breaks = seq(0, 10, 1)) +
+  theme(plot.title = element_text(hjust = 0.5), axis.title.y = element_blank())
+
+# Patchwork into one plot
+t1_fav_dist <- t1_dist_avg_fav + t1_dist_avg_fav_biden + t1_dist_avg_fav_trump + t1_dist_avg_fav_zuck + t1_dist_avg_fav_musk +
+  plot_layout(ncol = 5) +
+  plot_annotation(title = "Distribution of Favorability - Treatment 1")
+
+
+# Treatment 2
+# avg_fav
+t2_dist_avg_fav <- ggplot(d[treatment2==1], aes(x = avg_fav)) +
+  geom_histogram(binwidth = 1, fill = "grey", color = "black") +
+  geom_vline(aes(xintercept = t2_mean_avg_fav), color = "orange", linetype = "dashed", linewidth = 1) +
+  labs(title = "All", x = "Favorability", y = "Sample") +
+  theme_minimal() +
+  ylim(0, 50) +
+  scale_x_continuous(breaks = seq(0, 10, 1)) +
+  theme(plot.title = element_text(hjust = 0.5))
+
+# avg_fav_biden
+t2_dist_avg_fav_biden <- ggplot(d[treatment2==1], aes(x = avg_fav_biden)) +
+  geom_histogram(binwidth = 1, fill = "blue", color = "black") +
+  geom_vline(aes(xintercept = t2_mean_avg_fav), color = "orange", linetype = "dashed", linewidth = 1) +
+  labs(title = "Biden", x = "Favorability") +
+  theme_minimal() +
+  ylim(0, 40) +
+  scale_x_continuous(breaks = seq(0, 10, 1)) +
+  theme(plot.title = element_text(hjust = 0.5), axis.title.y = element_blank())
+
+# avg_fav_trump
+t2_dist_avg_fav_trump <- ggplot(d[treatment2==1], aes(x = avg_fav_trump)) +
+  geom_histogram(binwidth = 1, fill = "red", color = "black") +
+  geom_vline(aes(xintercept = t2_mean_avg_fav), color = "orange", linetype = "dashed", linewidth = 1) +
+  labs(title = "Trump", x = "Favorability") +
+  theme_minimal() +
+  ylim(0, 40) +
+  scale_x_continuous(breaks = seq(0, 10, 1)) +
+  theme(plot.title = element_text(hjust = 0.5), axis.title.y = element_blank())
+
+# avg_fav_zuck
+t2_dist_avg_fav_zuck <- ggplot(d[treatment2==1], aes(x = avg_fav_zuck)) +
+  geom_histogram(binwidth = 1, fill = "lightgreen", color = "black") +
+  geom_vline(aes(xintercept = t2_mean_avg_fav), color = "orange", linetype = "dashed", linewidth = 1) +
+  labs(title = "Zuckerberg", x = "Favorability") +
+  theme_minimal() +
+  ylim(0, 40) +
+  scale_x_continuous(breaks = seq(0, 10, 1)) +
+  theme(plot.title = element_text(hjust = 0.5), axis.title.y = element_blank())
+
+# avg_fav_musk
+t2_dist_avg_fav_musk <- ggplot(d[treatment2==1], aes(x = avg_fav_musk)) +
+  geom_histogram(binwidth = 1, fill = "lightgoldenrod", color = "black") +
+  geom_vline(aes(xintercept = t2_mean_avg_fav), color = "orange", linetype = "dashed", linewidth = 1) +
+  labs(title = "Musk", x = "Favorability") +
+  theme_minimal() +
+  ylim(0, 40) +
+  scale_x_continuous(breaks = seq(0, 10, 1)) +
+  theme(plot.title = element_text(hjust = 0.5), axis.title.y = element_blank())
+
+# Patchwork into one plot
+t2_fav_dist <- t2_dist_avg_fav + t2_dist_avg_fav_biden + t2_dist_avg_fav_trump + t2_dist_avg_fav_zuck + t2_dist_avg_fav_musk +
+  plot_layout(ncol = 5) +
+  plot_annotation(title = "Distribution of Favorability - Treatment 2")
+
+
+# Patchwork into one plot 
+assignment_fav_dist <- c_fav_dist / t1_fav_dist / t2_fav_dist + 
+  plot_layout(nrow = 3) +
+  plot_annotation(title = "Distribution of Favorability - Control (Top) / Treatment 1 (Middle) / Treatment 2 (Bottom)")
+
+print(assignment_fav_dist)
+```
+
+
+## ATE
+
+```{r ate method 1}
+# Average Treatment Effects
+control_mean <- d[control == 1, mean(avg_fav, na.rm = TRUE)]
+treatment1_mean <- d[treatment1 == 1, mean(avg_fav, na.rm = TRUE)]
+treatment2_mean <- d[treatment2 == 1, mean(avg_fav, na.rm = TRUE)]
+
+# ATE: Control vs Treatment 1
+ate_c_t1 <- treatment1_mean - control_mean
+cat("ATE of Treatment 1 compared to Control:", ate_c_t1, "\n")
+
+# ATE: Control vs Treatment 2
+ate_c_t2 <- treatment2_mean - control_mean
+cat("ATE of Treatment 2 compared to Control:", ate_c_t2, "\n")
+
+# ATE: Treatment 1 vs Treatment 2
+ate_t1_t2 <- treatment2_mean - treatment1_mean
+cat("ATE of Treatment 2 compared to Treatment 1:", ate_t1_t2, "\n")
+
+```
+
+```{r ate method 2}
+# Run the regression model with treatment1 and treatment2 as predictors
+model_1 <- lm(avg_fav ~ treatment1 + treatment2, data = d)
+
+summary(model_1)
+
+# Robust standard errors
+coef_test <- coeftest(model_1, vcov = vcovHC(model_1, type = "HC1"))
+
+# Extract coefficients
+coef <- summary(model_1)$coefficients
+
+ate_c_t1 <- coef["treatment1", "Estimate"]
+ate_c_t2 <- coef["treatment2", "Estimate"]
+ate_t1_t2 <- coef["treatment2", "Estimate"] - coef["treatment1", "Estimate"]
+
+p_c_t1 <- coef_test["treatment1", "Pr(>|t|)"]
+p_c_t2 <- coef_test["treatment2", "Pr(>|t|)"]
+
+cat("ATE of Treatment 1 compared to Control:", ate_c_t1, "\n")
+cat("ATE of Treatment 2 compared to Control:", ate_c_t2, "\n")
+cat("ATE of Treatment 2 compared to Treatment 1:", ate_t1_t2, "\n")
+```
+
+```{r ate method 3}
+# Datasets for each model, then running simple linear regression
+d_c_t1 <- d[control == 1 | treatment1 == 1]
+d_c_t2 <- d[control == 1 | treatment2 == 1]
+d_t1_t2 <- d[treatment1 == 1 | treatment2 == 1]
+
+model_2_c_t1 <- lm(avg_fav ~ treatment1, data = d_c_t1)
+model_2_c_t2 <- lm(avg_fav ~ treatment2, data = d_c_t2)
+model_2_t1_t2 <- lm(avg_fav ~ treatment2, data = d_t1_t2)
+
+#summary(model_2_c_t1)
+#coeftest(model_2_c_t1, vcov = vcovHC(model_2_c_t1, type = "HC1"))
+ate_c_t1 <- summary(model_2_c_t1)$coefficients["treatment1", "Estimate"]
+cat("ATE of Treatment 1 compared to Control:", ate_c_t1, "\n")
+
+#summary(model_2_c_t2)
+#coeftest(model_2_c_t2, vcov = vcovHC(model_2_c_t2, type = "HC1"))
+ate_c_t2 <- summary(model_2_c_t2)$coefficients["treatment2", "Estimate"]
+cat("ATE of Treatment 2 compared to Control:", ate_c_t2, "\n")
+
+#summary(model_2_t1_t2)
+#coeftest(model_2_t1_t2, vcov = vcovHC(model_2_t1_t2, type = "HC1"))
+ate_t1_t2 <- summary(model_2_t1_t2)$coefficients["treatment2", "Estimate"]
+cat("ATE of Treatment 2 compared to Treatment 1:", ate_t1_t2, "\n")
+```
+
+```{r stargazer}
+# Robust standard error
+se_1 <- sqrt(diag(vcovHC(model_1, type = "HC1")))
+
+# Display the results using stargazer
+stargazer(model_1,
+          se = list(se_1),
+          type = "text", 
+          title = "Regression Results",
+          dep.var.labels = "Average Favorability",
+          covariate.labels = c("Treatment 1", "Treatment 2"),
+          omit.stat = c("f", "ser"), # Omit F-statistic and Standard Error of Regression
+          star.cutoffs = c(0.05, 0.01, 0.001), # Custom significance levels
+          notes = "Robust standard errors are in parentheses.",
+          notes.align = "l",
+          digits = 3)
+```
+
+
+```{r ate method 2 across individuals}
+# Biden
+model_1_biden <- lm(avg_fav_biden ~ treatment1 + treatment2, data = d)
+#summary(model_1_biden)
+biden_test <- coeftest(model_1_biden, vcov = vcovHC(model_1_biden, type = "HC1"))
+biden_test
+coef_biden <- summary(model_1_biden)$coefficients
+
+ate_c_t1_biden <- coef_biden["treatment1", "Estimate"]
+ate_c_t2_biden <- coef_biden["treatment2", "Estimate"]
+ate_t1_t2_biden <- coef_biden["treatment2", "Estimate"] - coef_biden["treatment1", "Estimate"]
+
+p_c_t1_biden <- biden_test["treatment1", "Pr(>|t|)"]
+p_c_t2_biden <- biden_test["treatment2", "Pr(>|t|)"]
+
+cat("ATE of Treatment 1 compared to Control for Biden:", ate_c_t1_biden, "\n")
+cat("ATE of Treatment 2 compared to Control for Biden:", ate_c_t2_biden, "\n")
+cat("ATE of Treatment 2 compared to Treatment 1 for Biden:", ate_t1_t2_biden, "\n")
+
+# Trump
+model_1_trump <- lm(avg_fav_trump ~ treatment1 + treatment2, data = d)
+#summary(model_1_trump)
+trump_test <- coeftest(model_1_trump, vcov = vcovHC(model_1_trump, type = "HC1"))
+trump_test
+coef_trump <- summary(model_1_trump)$coefficients
+
+ate_c_t1_trump <- coef_trump["treatment1", "Estimate"]
+ate_c_t2_trump <- coef_trump["treatment2", "Estimate"]
+ate_t1_t2_trump <- coef_trump["treatment2", "Estimate"] - coef_trump["treatment1", "Estimate"]
+
+p_c_t1_trump <- trump_test["treatment1", "Pr(>|t|)"]
+p_c_t2_trump <- trump_test["treatment2", "Pr(>|t|)"]
+
+cat("ATE of Treatment 1 compared to Control for Trump:", ate_c_t1_trump, "\n")
+cat("ATE of Treatment 2 compared to Control for Trump:", ate_c_t2_trump, "\n")
+cat("ATE of Treatment 2 compared to Treatment 1 for Trump:", ate_t1_t2_trump, "\n")
+
+# Zuckerberg
+model_1_zuck <- lm(avg_fav_zuck ~ treatment1 + treatment2, data = d)
+#summary(model_1_zuck)
+zuck_test <- coeftest(model_1_zuck, vcov = vcovHC(model_1_zuck, type = "HC1"))
+zuck_test
+coef_zuck <- summary(model_1_zuck)$coefficients
+
+ate_c_t1_zuck <- coef_zuck["treatment1", "Estimate"]
+ate_c_t2_zuck <- coef_zuck["treatment2", "Estimate"]
+ate_t1_t2_zuck <- coef_zuck["treatment2", "Estimate"] - coef_zuck["treatment1", "Estimate"]
+
+p_c_t1_zuck <- zuck_test["treatment1", "Pr(>|t|)"]
+p_c_t2_zuck <- zuck_test["treatment2", "Pr(>|t|)"]
+
+cat("ATE of Treatment 1 compared to Control for Zuckerberg:", ate_c_t1_zuck, "\n")
+cat("ATE of Treatment 2 compared to Control for Zuckerberg:", ate_c_t2_zuck, "\n")
+cat("ATE of Treatment 2 compared to Treatment 1 for Zuckerberg:", ate_t1_t2_zuck, "\n")
+
+# Musk
+model_1_musk <- lm(avg_fav_musk ~ treatment1 + treatment2, data = d)
+#summary(model_1_musk)
+musk_test <- coeftest(model_1_musk, vcov = vcovHC(model_1_musk, type = "HC1"))
+musk_test
+coef_musk <- summary(model_1_musk)$coefficients
+
+ate_c_t1_musk <- coef_musk["treatment1", "Estimate"]
+ate_c_t2_musk <- coef_musk["treatment2", "Estimate"]
+ate_t1_t2_musk <- coef_musk["treatment2", "Estimate"] - coef_musk["treatment1", "Estimate"]
+
+p_c_t1_musk <- musk_test["treatment1", "Pr(>|t|)"]
+p_c_t2_musk <- musk_test["treatment2", "Pr(>|t|)"]
+
+cat("ATE of Treatment 1 compared to Control for Musk:", ate_c_t1_musk, "\n")
+cat("ATE of Treatment 2 compared to Control for Musk:", ate_c_t2_musk, "\n")
+cat("ATE of Treatment 2 compared to Treatment 1 for Musk:", ate_t1_t2_musk, "\n")
+```
+
+```{r ate method 2 across individuals into table}
+ate_p_values_df <- data.frame(
+  Individual = c("Average", "Biden", "Trump", "Zuckerberg", "Musk"),
+  ATE_C_T1 = c(ate_c_t1, ate_c_t1_biden, ate_c_t1_trump, ate_c_t1_zuck, ate_c_t1_musk),
+  P_Value_C_T1 = c(p_c_t1, p_c_t1_biden, p_c_t1_trump, p_c_t1_zuck, p_c_t1_musk),
+  ATE_C_T2 = c(ate_c_t2, ate_c_t2_biden, ate_c_t2_trump, ate_c_t2_zuck, ate_c_t2_musk),
+  P_Value_C_T2 = c(p_c_t2, p_c_t2_biden, p_c_t2_trump, p_c_t2_zuck, p_c_t2_musk),
+  ATE_T1_T2 = c(ate_t1_t2, ate_t1_t2_biden, ate_t1_t2_trump, ate_t1_t2_zuck, ate_t1_t2_musk),
+  P_Value_T1_T2 = c(0.4244, 0.5972, 0.9712, 0.3749, 0.6552)
+)
+
+ate_p_values_df %>%
+  mutate(across(starts_with("ATE"), round, 3)) %>%
+  mutate(across(starts_with("P_Value"), round, 3)) %>%
+  kable(caption = "Average Treatment Effects (ATE) and P-Values for Each Individual", 
+        col.names = c("Individual", 
+                      "ATE: Control vs Treatment 1", "P-Value", 
+                      "ATE: Control vs Treatment 2", "P-Value", 
+                      "ATE: Treatment 1 vs Treatment 2", "P-Value"))
+```
+
+```{r stargazer across individuals, results='asis'}
+# Robust standard errors
+se_mod_1_avg <- sqrt(diag(vcovHC(model_1, type = "HC1")))
+se_mod_1_biden <- sqrt(diag(vcovHC(model_1_biden, type = "HC1")))
+se_mod_1_trump <- sqrt(diag(vcovHC(model_1_trump, type = "HC1")))
+se_mod_1_zuck <- sqrt(diag(vcovHC(model_1_zuck, type = "HC1")))
+se_mod_1_musk <- sqrt(diag(vcovHC(model_1_musk, type = "HC1")))
+
+
+# Stargazer
+stargazer(model_1, model_1_biden, model_1_trump, model_1_zuck, model_1_musk,
+          se = list(se_mod_1_avg, se_mod_1_biden, se_mod_1_trump, se_mod_1_zuck, se_mod_1_musk),
+          type = "text", 
+          title = "Baseline Regression Results: Average and Individual Favorabilities",
+          column.labels = c("All", "Biden", "Trump", "Zuckerberg", "Musk"),
+          dep.var.labels = c("Favorability", "Favorability", "Favorability", "Favorability", "Favorability"),
+          omit.stat = c("f", "ser"), # Omit F-statistic and Standard Error of Regression
+          star.cutoffs = c(0.05, 0.01, 0.001), # Custom significance levels
+          notes = "Robust standard errors are in parentheses.",
+          notes.align = "l",
+          digits = 3
+          )
+```
+
+
+## ATE with Linear Models Across Demographics
+
+```{r ate method 2 across age groups}
+# 18-34 YO's
+model_1_18_34 <- lm(avg_fav ~ treatment1 + treatment2, data = d[age_group=='18-34'])
+coeftest(model_1_18_34, vcov = vcovHC(model_1_18_34, type = "HC1"))
+coef_18_34 <- summary(model_1_18_34)$coefficients
+ate_c_t1_18_34 <- coef_18_34["treatment1", "Estimate"]
+ate_c_t2_18_34 <- coef_18_34["treatment2", "Estimate"]
+ate_t1_t2_18_34 <- coef_18_34["treatment2", "Estimate"] - coef_18_34["treatment1", "Estimate"]
+cat("ATE of Treatment 1 compared to Control for 18-34 YO:", ate_c_t1_18_34, "\n")
+cat("ATE of Treatment 2 compared to Control for 18-34 YO:", ate_c_t2_18_34, "\n")
+cat("ATE of Treatment 2 compared to Treatment 1 for 18-34 YO:", ate_t1_t2_18_34, "\n")
+
+# 35-49 YO's
+model_1_35_49 <- lm(avg_fav ~ treatment1 + treatment2, data = d[age_group=='35-49'])
+coeftest(model_1_35_49, vcov = vcovHC(model_1_35_49, type = "HC1"))
+coef_35_49 <- summary(model_1_35_49)$coefficients
+ate_c_t1_35_49 <- coef_35_49["treatment1", "Estimate"]
+ate_c_t2_35_49 <- coef_35_49["treatment2", "Estimate"]
+ate_t1_t2_35_49 <- coef_35_49["treatment2", "Estimate"] - coef_35_49["treatment1", "Estimate"]
+cat("ATE of Treatment 1 compared to Control for 35-49 YO:", ate_c_t1_35_49, "\n")
+cat("ATE of Treatment 2 compared to Control for 35-49 YO:", ate_c_t2_35_49, "\n")
+cat("ATE of Treatment 2 compared to Treatment 1 for 35-49 YO:", ate_t1_t2_35_49, "\n")
+
+# 50-64 YO's
+model_1_50_64 <- lm(avg_fav ~ treatment1 + treatment2, data = d[age_group=='50-64'])
+coeftest(model_1_50_64, vcov = vcovHC(model_1_50_64, type = "HC1"))
+coef_50_64 <- summary(model_1_50_64)$coefficients
+ate_c_t1_50_64 <- coef_50_64["treatment1", "Estimate"]
+ate_c_t2_50_64 <- coef_50_64["treatment2", "Estimate"]
+ate_t1_t2_50_64 <- coef_50_64["treatment2", "Estimate"] - coef_50_64["treatment1", "Estimate"]
+cat("ATE of Treatment 1 compared to Control for 50-64 YO:", ate_c_t1_50_64, "\n")
+cat("ATE of Treatment 2 compared to Control for 50-64 YO:", ate_c_t2_50_64, "\n")
+cat("ATE of Treatment 2 compared to Treatment 1 for 50-64 YO:", ate_t1_t2_50_64, "\n")
+
+# 65+ YO's
+model_1_65 <- lm(avg_fav ~ treatment1 + treatment2, data = d[age_group=='65+'])
+coeftest(model_1_65, vcov = vcovHC(model_1_65, type = "HC1"))
+coef_65 <- summary(model_1_65)$coefficients
+ate_c_t1_65 <- coef_65["treatment1", "Estimate"]
+ate_c_t2_65 <- coef_65["treatment2", "Estimate"]
+ate_t1_t2_65 <- coef_65["treatment2", "Estimate"] - coef_65["treatment1", "Estimate"]
+cat("ATE of Treatment 1 compared to Control for 65+ YO:", ate_c_t1_65, "\n")
+cat("ATE of Treatment 2 compared to Control for 65+ YO:", ate_c_t2_65, "\n")
+cat("ATE of Treatment 2 compared to Treatment 1 for 65+ YO:", ate_t1_t2_65, "\n")
+```
+
+```{r, results='asis'}
+# Robust standard errors
+se_1_18_34 <- sqrt(diag(vcovHC(model_1_18_34, type = "HC1")))
+se_1_35_49 <- sqrt(diag(vcovHC(model_1_35_49, type = "HC1")))
+se_1_50_64 <- sqrt(diag(vcovHC(model_1_50_64, type = "HC1")))
+se_1_65 <- sqrt(diag(vcovHC(model_1_65, type = "HC1")))
+
+
+# Stargazer
+stargazer(model_1_18_34, model_1_35_49, model_1_50_64, model_1_65,
+          se = list(se_1_18_34, se_1_35_49, se_1_50_64, se_1_65),
+          type = "text", 
+          title = "Regression Results by Age Group",
+          column.labels = c("18-34", "35-49", "50-64", "65+"),
+          dep.var.labels = "Average Favorability",
+          covariate.labels = c("Treatment 1", "Treatment 2"),
+          omit.stat = c("f", "ser"), # Omit F-statistic and Standard Error of Regression
+          star.cutoffs = c(0.05, 0.01, 0.001), # Custom significance levels
+          notes = "Robust standard errors are in parentheses.",
+          notes.align = "l",
+          digits = 3)
+
+```
+
+
+```{r ate method 2 across gender}
+# Male
+model_1_male <- lm(avg_fav ~ treatment1 + treatment2, data = d[gender=='Male'])
+coeftest(model_1_male, vcov = vcovHC(model_1_male, type = "HC1"))
+coef_male <- summary(model_1_male)$coefficients
+ate_c_t1_male <- coef_male["treatment1", "Estimate"]
+ate_c_t2_male <- coef_male["treatment2", "Estimate"]
+ate_t1_t2_male <- coef_male["treatment2", "Estimate"] - coef_male["treatment1", "Estimate"]
+cat("ATE of Treatment 1 compared to Control for Male:", ate_c_t1_male, "\n")
+cat("ATE of Treatment 2 compared to Control for Male:", ate_c_t2_male, "\n")
+cat("ATE of Treatment 2 compared to Treatment 1 for Male:", ate_t1_t2_male, "\n")
+
+# Female
+model_1_female <- lm(avg_fav ~ treatment1 + treatment2, data = d[gender=='Female'])
+coeftest(model_1_female, vcov = vcovHC(model_1_female, type = "HC1"))
+coef_female <- summary(model_1_female)$coefficients
+ate_c_t1_female <- coef_female["treatment1", "Estimate"]
+ate_c_t2_female <- coef_female["treatment2", "Estimate"]
+ate_t1_t2_female <- coef_female["treatment2", "Estimate"] - coef_female["treatment1", "Estimate"]
+cat("ATE of Treatment 1 compared to Control for Female:", ate_c_t1_female, "\n")
+cat("ATE of Treatment 2 compared to Control for Female:", ate_c_t2_female, "\n")
+cat("ATE of Treatment 2 compared to Treatment 1 for Female:", ate_t1_t2_female, "\n")
+```
+
+```{r, results='asis'}
+# Robust standard errors
+se_1_male <- sqrt(diag(vcovHC(model_1_male, type = "HC1")))
+se_1_female <- sqrt(diag(vcovHC(model_1_female, type = "HC1")))
+
+# Stargazer
+stargazer(model_1_male, model_1_female,
+          se = list(se_1_male, se_1_female),
+          type = "latex", 
+          title = "Regression Results by Gender",
+          column.labels = c("Male", "Female"),
+          dep.var.labels = "Average Favorability",
+          covariate.labels = c("Treatment 1", "Treatment 2"),
+          omit.stat = c("f", "ser"), # Omit F-statistic and Standard Error of Regression
+          star.cutoffs = c(0.05, 0.01, 0.001), # Custom significance levels
+          notes = "Robust standard errors are in parentheses.",
+          notes.align = "l",
+          digits = 3)
+```
+
+```{r ate method 2 across party}
+# Dem
+model_1_dem <- lm(avg_fav ~ treatment1 + treatment2, data = d[party=='Democrat'])
+coeftest(model_1_dem, vcov = vcovHC(model_1_dem, type = "HC1"))
+coef_dem <- summary(model_1_dem)$coefficients
+ate_c_t1_dem <- coef_dem["treatment1", "Estimate"]
+ate_c_t2_dem <- coef_dem["treatment2", "Estimate"]
+ate_t1_t2_dem <- coef_dem["treatment2", "Estimate"] - coef_dem["treatment1", "Estimate"]
+cat("ATE of Treatment 1 compared to Control for Democrats:", ate_c_t1_dem, "\n")
+cat("ATE of Treatment 2 compared to Control for Democrats:", ate_c_t2_dem, "\n")
+cat("ATE of Treatment 2 compared to Treatment 1 for Democrats:", ate_t1_t2_dem, "\n")
+
+# Rep
+model_1_rep <- lm(avg_fav ~ treatment1 + treatment2, data = d[party=='Republican'])
+coeftest(model_1_rep, vcov = vcovHC(model_1_rep, type = "HC1"))
+coef_rep <- summary(model_1_rep)$coefficients
+ate_c_t1_rep <- coef_rep["treatment1", "Estimate"]
+ate_c_t2_rep <- coef_rep["treatment2", "Estimate"]
+ate_t1_t2_rep <- coef_rep["treatment2", "Estimate"] - coef_rep["treatment1", "Estimate"]
+cat("ATE of Treatment 1 compared to Control for Republicans:", ate_c_t1_rep, "\n")
+cat("ATE of Treatment 2 compared to Control for Republicans:", ate_c_t2_rep, "\n")
+cat("ATE of Treatment 2 compared to Treatment 1 for Republicans:", ate_t1_t2_rep, "\n")
+
+# Ind
+model_1_ind <- lm(avg_fav ~ treatment1 + treatment2, data = d[party=='Independent'])
+coeftest(model_1_ind, vcov = vcovHC(model_1_ind, type = "HC1"))
+coef_ind <- summary(model_1_ind)$coefficients
+ate_c_t1_ind <- coef_ind["treatment1", "Estimate"]
+ate_c_t2_ind <- coef_ind["treatment2", "Estimate"]
+ate_t1_t2_ind <- coef_ind["treatment2", "Estimate"] - coef_ind["treatment1", "Estimate"]
+cat("ATE of Treatment 1 compared to Control for Independents:", ate_c_t1_ind, "\n")
+cat("ATE of Treatment 2 compared to Control for Independents:", ate_c_t2_ind, "\n")
+cat("ATE of Treatment 2 compared to Treatment 1 for Independents:", ate_t1_t2_ind, "\n")
+```
+
+```{r ate method 2 across ideology}
+# Liberal
+model_1_lib <- lm(avg_fav ~ treatment1 + treatment2, data = d[ideology=='Liberal'])
+coeftest(model_1_lib, vcov = vcovHC(model_1_lib, type = "HC1"))
+coef_lib <- summary(model_1_lib)$coefficients
+ate_c_t1_lib <- coef_lib["treatment1", "Estimate"]
+ate_c_t2_lib <- coef_lib["treatment2", "Estimate"]
+ate_t1_t2_lib <- coef_lib["treatment2", "Estimate"] - coef_lib["treatment1", "Estimate"]
+cat("ATE of Treatment 1 compared to Control for Liberals:", ate_c_t1_lib, "\n")
+cat("ATE of Treatment 2 compared to Control for Liberals:", ate_c_t2_lib, "\n")
+cat("ATE of Treatment 2 compared to Treatment 1 for Liberals:", ate_t1_t2_lib, "\n")
+
+# Conservative
+model_1_con <- lm(avg_fav ~ treatment1 + treatment2, data = d[ideology=='Conservative'])
+coeftest(model_1_con, vcov = vcovHC(model_1_con, type = "HC1"))
+coef_con <- summary(model_1_con)$coefficients
+ate_c_t1_con <- coef_con["treatment1", "Estimate"]
+ate_c_t2_con <- coef_con["treatment2", "Estimate"]
+ate_t1_t2_con <- coef_con["treatment2", "Estimate"] - coef_con["treatment1", "Estimate"]
+cat("ATE of Treatment 1 compared to Control for Conservatives:", ate_c_t1_con, "\n")
+cat("ATE of Treatment 2 compared to Control for Conservatives:", ate_c_t2_con, "\n")
+cat("ATE of Treatment 2 compared to Treatment 1 for Conservatives:", ate_t1_t2_con, "\n")
+
+# Moderate
+model_1_mod <- lm(avg_fav ~ treatment1 + treatment2, data = d[ideology=='Neither liberal nor conservative'])
+coeftest(model_1_mod, vcov = vcovHC(model_1_mod, type = "HC1"))
+coef_mod <- summary(model_1_mod)$coefficients
+ate_c_t1_mod <- coef_mod["treatment1", "Estimate"]
+ate_c_t2_mod <- coef_mod["treatment2", "Estimate"]
+ate_t1_t2_mod <- coef_mod["treatment2", "Estimate"] - coef_mod["treatment1", "Estimate"]
+cat("ATE of Treatment 1 compared to Control for Moderates:", ate_c_t1_mod, "\n")
+cat("ATE of Treatment 2 compared to Control for Moderates:", ate_c_t2_mod, "\n")
+cat("ATE of Treatment 2 compared to Treatment 1 for Moderates:", ate_t1_t2_mod, "\n")
+```
+
+```{r ate method 2 across industry_tech}
+# Tech
+model_1_tech <- lm(avg_fav ~ treatment1 + treatment2, data = d[industry_tech=='Technology'])
+coeftest(model_1_tech, vcov = vcovHC(model_1_tech, type = "HC1"))
+coef_tech <- summary(model_1_tech)$coefficients
+ate_c_t1_tech <- coef_tech["treatment1", "Estimate"]
+ate_c_t2_tech <- coef_tech["treatment2", "Estimate"]
+ate_t1_t2_tech <- coef_tech["treatment2", "Estimate"] - coef_tech["treatment1", "Estimate"]
+cat("ATE of Treatment 1 compared to Control for Technology:", ate_c_t1_tech, "\n")
+cat("ATE of Treatment 2 compared to Control for Technology:", ate_c_t2_tech, "\n")
+cat("ATE of Treatment 2 compared to Treatment 1 for Technology:", ate_t1_t2_tech, "\n")
+```
+
+```{r building model}
+# Build model with demographics one at a time and run f-tests to determine best model
+
+# Baseline model with treatment group only
+multi_mod_1 <- lm(avg_fav ~ treatment_group, data = d)
+
+multi_mod_2 <- lm(avg_fav ~ treatment_group + age_group, data = d)
+#summary(multi_mod_2)
+#anova(multi_mod_1, multi_mod_2)
+
+multi_mod_3 <- lm(avg_fav ~ treatment_group + age_group + gender, data = d)
+#summary(multi_mod_3)
+#anova(multi_mod_2, multi_mod_3)
+
+multi_mod_4 <- lm(avg_fav ~ treatment_group + age_group + gender + party, data = d)
+#summary(multi_mod_4)
+#anova(multi_mod_3, multi_mod_4)
+
+multi_mod_5 <- lm(avg_fav ~ treatment_group + age_group + gender + party + ideology, data = d)
+#summary(multi_mod_5)
+#anova(multi_mod_4, multi_mod_5)
+
+multi_mod_6 <- lm(avg_fav ~ treatment_group + age_group + gender + party + industry_tech, data = d)
+#summary(multi_mod_6)
+#anova(multi_mod_4, multi_mod_6)
+
+multi_mod_7 <- lm(avg_fav ~ treatment_group + age_group + gender + party + industry_tech + ideology, data = d)
+#summary(multi_mod_7)
+#anova(multi_mod_6, multi_mod_7)
+
+# multi_mod_6 seems to be the "best" model
+
+```
+
+```{r model 6 on individual favorabilities}
+mod_6_biden <- lm(avg_fav_biden ~ treatment_group + age_group + gender + party + industry_tech, data = d)
+mod_6_trump <- lm(avg_fav_trump ~ treatment_group + age_group + gender + party + industry_tech, data = d)
+mod_6_zuck <- lm(avg_fav_zuck ~ treatment_group + age_group + gender + party + industry_tech, data = d)
+mod_6_musk <- lm(avg_fav_musk ~ treatment_group + age_group + gender + party + industry_tech, data = d)
+
+summary(mod_6_biden)
+summary(mod_6_trump)
+summary(mod_6_zuck)
+summary(mod_6_musk)
+```
+
+```{r stargazer for model 6, results='asis'}
+# Robust standard errors
+se_mod_6_avg <- sqrt(diag(vcovHC(multi_mod_6, type = "HC1")))
+se_mod_6_biden <- sqrt(diag(vcovHC(mod_6_biden, type = "HC1")))
+se_mod_6_trump <- sqrt(diag(vcovHC(mod_6_trump, type = "HC1")))
+se_mod_6_zuck <- sqrt(diag(vcovHCmod_6_zuck, type = "HC1")))
+se_mod_6_musk <- sqrt(diag(vcovHC(mod_6_musk, type = "HC1")))
+
+
+# Stargazer
+stargazer(multi_mod_6, mod_6_biden, mod_6_trump, mod_6_zuck, mod_6_musk,
+          se = list(se_mod_6_avg, se_mod_6_biden, se_mod_6_trump, se_mod_6_zuck, se_mod_6_musk),
+          type = "text", 
+          title = "Multivariate Regression Results: Average and Individual Favorabilities",
+          column.labels = c("All", "Biden", "Trump", "Zuckerberg", "Musk"),
+          dep.var.labels = c("Favorability", "Favorability", "Favorability", "Favorability", "Favorability"),
+          omit.stat = c("f", "ser"), # Omit F-statistic and Standard Error of Regression
+          star.cutoffs = c(0.05, 0.01, 0.001), # Custom significance levels
+          notes = "Robust standard errors are in parentheses.",
+          notes.align = "l",
+          digits = 3
+          )
+```
+
+```{r redoing the subgroup ate analysis with model 6}
+# 18-34 YO's
+model_6_18_34 <- lm(avg_fav ~ treatment1 + treatment2 + gender + party + industry_tech, data = d[age_group=='18-34'])
+coeftest(model_6_18_34, vcov = vcovHC(model_6_18_34, type = "HC1"))
+coef_18_34 <- summary(model_6_18_34)$coefficients
+ate_c_t1_18_34 <- coef_18_34["treatment1", "Estimate"]
+ate_c_t2_18_34 <- coef_18_34["treatment2", "Estimate"]
+ate_t1_t2_18_34 <- coef_18_34["treatment2", "Estimate"] - coef_18_34["treatment1", "Estimate"]
+cat("ATE of Treatment 1 compared to Control for 18-34 YO:", ate_c_t1_18_34, "\n")
+cat("ATE of Treatment 2 compared to Control for 18-34 YO:", ate_c_t2_18_34, "\n")
+cat("ATE of Treatment 2 compared to Treatment 1 for 18-34 YO:", ate_t1_t2_18_34, "\n")
+
+# 35-49 YO's
+model_6_35_49 <- lm(avg_fav ~ treatment1 + treatment2 + gender + party + industry_tech, data = d[age_group=='35-49'])
+coeftest(model_6_35_49, vcov = vcovHC(model_6_35_49, type = "HC1"))
+coef_35_49 <- summary(model_6_35_49)$coefficients
+ate_c_t1_35_49 <- coef_35_49["treatment1", "Estimate"]
+ate_c_t2_35_49 <- coef_35_49["treatment2", "Estimate"]
+ate_t1_t2_35_49 <- coef_35_49["treatment2", "Estimate"] - coef_35_49["treatment1", "Estimate"]
+cat("ATE of Treatment 1 compared to Control for 35-49 YO:", ate_c_t1_35_49, "\n")
+cat("ATE of Treatment 2 compared to Control for 35-49 YO:", ate_c_t2_35_49, "\n")
+cat("ATE of Treatment 2 compared to Treatment 1 for 35-49 YO:", ate_t1_t2_35_49, "\n")
+
+# 50-64 YO's
+model_6_50_64 <- lm(avg_fav ~ treatment1 + treatment2 + gender + party + industry_tech, data = d[age_group=='50-64'])
+coeftest(model_6_50_64, vcov = vcovHC(model_6_50_64, type = "HC1"))
+coef_50_64 <- summary(model_6_50_64)$coefficients
+ate_c_t1_50_64 <- coef_50_64["treatment1", "Estimate"]
+ate_c_t2_50_64 <- coef_50_64["treatment2", "Estimate"]
+ate_t1_t2_50_64 <- coef_50_64["treatment2", "Estimate"] - coef_50_64["treatment1", "Estimate"]
+cat("ATE of Treatment 1 compared to Control for 50-64 YO:", ate_c_t1_50_64, "\n")
+cat("ATE of Treatment 2 compared to Control for 50-64 YO:", ate_c_t2_50_64, "\n")
+cat("ATE of Treatment 2 compared to Treatment 1 for 50-64 YO:", ate_t1_t2_50_64, "\n")
+
+# 65+ YO's
+model_6_65 <- lm(avg_fav ~ treatment1 + treatment2 + gender + party + industry_tech, data = d[age_group=='65+'])
+coeftest(model_6_65, vcov = vcovHC(model_6_65, type = "HC1"))
+coef_65 <- summary(model_6_65)$coefficients
+ate_c_t1_65 <- coef_65["treatment1", "Estimate"]
+ate_c_t2_65 <- coef_65["treatment2", "Estimate"]
+ate_t1_t2_65 <- coef_65["treatment2", "Estimate"] - coef_65["treatment1", "Estimate"]
+cat("ATE of Treatment 1 compared to Control for 65+ YO:", ate_c_t1_65, "\n")
+cat("ATE of Treatment 2 compared to Control for 65+ YO:", ate_c_t2_65, "\n")
+cat("ATE of Treatment 2 compared to Treatment 1 for 65+ YO:", ate_t1_t2_65, "\n")
+
+# Male
+model_6_male <- lm(avg_fav ~ treatment1 + treatment2 + party + industry_tech, data = d[gender=='Male'])
+coeftest(model_6_male, vcov = vcovHC(model_6_male, type = "HC1"))
+coef_male <- summary(model_6_male)$coefficients
+ate_c_t1_male <- coef_male["treatment1", "Estimate"]
+ate_c_t2_male <- coef_male["treatment2", "Estimate"]
+ate_t1_t2_male <- coef_male["treatment2", "Estimate"] - coef_male["treatment1", "Estimate"]
+cat("ATE of Treatment 1 compared to Control for Male:", ate_c_t1_male, "\n")
+cat("ATE of Treatment 2 compared to Control for Male:", ate_c_t2_male, "\n")
+cat("ATE of Treatment 2 compared to Treatment 1 for Male:", ate_t1_t2_male, "\n")
+
+# Female
+model_6_female <- lm(avg_fav ~ treatment1 + treatment2 + party + industry_tech, data = d[gender=='Female'])
+coeftest(model_6_female, vcov = vcovHC(model_6_female, type = "HC1"))
+coef_female <- summary(model_6_female)$coefficients
+ate_c_t1_female <- coef_female["treatment1", "Estimate"]
+ate_c_t2_female <- coef_female["treatment2", "Estimate"]
+ate_t1_t2_female <- coef_female["treatment2", "Estimate"] - coef_female["treatment1", "Estimate"]
+cat("ATE of Treatment 1 compared to Control for Female:", ate_c_t1_female, "\n")
+cat("ATE of Treatment 2 compared to Control for Female:", ate_c_t2_female, "\n")
+cat("ATE of Treatment 2 compared to Treatment 1 for Female:", ate_t1_t2_female, "\n")
+
+# Dem
+model_6_dem <- lm(avg_fav ~ treatment1 + treatment2 + gender + industry_tech, data = d[party=='Democrat'])
+coeftest(model_6_dem, vcov = vcovHC(model_6_dem, type = "HC1"))
+coef_dem <- summary(model_6_dem)$coefficients
+ate_c_t1_dem <- coef_dem["treatment1", "Estimate"]
+ate_c_t2_dem <- coef_dem["treatment2", "Estimate"]
+ate_t1_t2_dem <- coef_dem["treatment2", "Estimate"] - coef_dem["treatment1", "Estimate"]
+cat("ATE of Treatment 1 compared to Control for Democrats:", ate_c_t1_dem, "\n")
+cat("ATE of Treatment 2 compared to Control for Democrats:", ate_c_t2_dem, "\n")
+cat("ATE of Treatment 2 compared to Treatment 1 for Democrats:", ate_t1_t2_dem, "\n")
+
+# Rep
+model_6_rep <- lm(avg_fav ~ treatment1 + treatment2 + gender + industry_tech, data = d[party=='Republican'])
+coeftest(model_6_rep, vcov = vcovHC(model_6_rep, type = "HC1"))
+coef_rep <- summary(model_6_rep)$coefficients
+ate_c_t1_rep <- coef_rep["treatment1", "Estimate"]
+ate_c_t2_rep <- coef_rep["treatment2", "Estimate"]
+ate_t1_t2_rep <- coef_rep["treatment2", "Estimate"] - coef_rep["treatment1", "Estimate"]
+cat("ATE of Treatment 1 compared to Control for Republicans:", ate_c_t1_rep, "\n")
+cat("ATE of Treatment 2 compared to Control for Republicans:", ate_c_t2_rep, "\n")
+cat("ATE of Treatment 2 compared to Treatment 1 for Republicans:", ate_t1_t2_rep, "\n")
+
+# Ind
+model_6_ind <- lm(avg_fav ~ treatment1 + treatment2 + gender + industry_tech, data = d[party=='Independent'])
+coeftest(model_6_ind, vcov = vcovHC(model_6_ind, type = "HC1"))
+coef_ind <- summary(model_6_ind)$coefficients
+ate_c_t1_ind <- coef_ind["treatment1", "Estimate"]
+ate_c_t2_ind <- coef_ind["treatment2", "Estimate"]
+ate_t1_t2_ind <- coef_ind["treatment2", "Estimate"] - coef_ind["treatment1", "Estimate"]
+cat("ATE of Treatment 1 compared to Control for Independents:", ate_c_t1_ind, "\n")
+cat("ATE of Treatment 2 compared to Control for Independents:", ate_c_t2_ind, "\n")
+cat("ATE of Treatment 2 compared to Treatment 1 for Independents:", ate_t1_t2_ind, "\n")
+
+# Liberal
+model_6_lib <- lm(avg_fav ~ treatment1 + treatment2 + gender + party + industry_tech, data = d[ideology=='Liberal'])
+coeftest(model_6_lib, vcov = vcovHC(model_6_lib, type = "HC1"))
+coef_lib <- summary(model_6_lib)$coefficients
+ate_c_t1_lib <- coef_lib["treatment1", "Estimate"]
+ate_c_t2_lib <- coef_lib["treatment2", "Estimate"]
+ate_t1_t2_lib <- coef_lib["treatment2", "Estimate"] - coef_lib["treatment1", "Estimate"]
+cat("ATE of Treatment 1 compared to Control for Liberals:", ate_c_t1_lib, "\n")
+cat("ATE of Treatment 2 compared to Control for Liberals:", ate_c_t2_lib, "\n")
+cat("ATE of Treatment 2 compared to Treatment 1 for Liberals:", ate_t1_t2_lib, "\n")
+
+# Conservative
+model_6_con <- lm(avg_fav ~ treatment1 + treatment2 + gender + party + industry_tech, data = d[ideology=='Conservative'])
+coeftest(model_6_con, vcov = vcovHC(model_6_con, type = "HC1"))
+coef_con <- summary(model_6_con)$coefficients
+ate_c_t1_con <- coef_con["treatment1", "Estimate"]
+ate_c_t2_con <- coef_con["treatment2", "Estimate"]
+ate_t1_t2_con <- coef_con["treatment2", "Estimate"] - coef_con["treatment1", "Estimate"]
+cat("ATE of Treatment 1 compared to Control for Conservatives:", ate_c_t1_con, "\n")
+cat("ATE of Treatment 2 compared to Control for Conservatives:", ate_c_t2_con, "\n")
+cat("ATE of Treatment 2 compared to Treatment 1 for Conservatives:", ate_t1_t2_con, "\n")
+
+# Moderate
+model_6_mod <- lm(avg_fav ~ treatment1 + treatment2 + gender + party + industry_tech, data = d[ideology=='Neither liberal nor conservative'])
+coeftest(model_6_mod, vcov = vcovHC(model_6_mod, type = "HC1"))
+coef_mod <- summary(model_6_mod)$coefficients
+ate_c_t1_mod <- coef_mod["treatment1", "Estimate"]
+ate_c_t2_mod <- coef_mod["treatment2", "Estimate"]
+ate_t1_t2_mod <- coef_mod["treatment2", "Estimate"] - coef_mod["treatment1", "Estimate"]
+cat("ATE of Treatment 1 compared to Control for Moderates:", ate_c_t1_mod, "\n")
+cat("ATE of Treatment 2 compared to Control for Moderates:", ate_c_t2_mod, "\n")
+cat("ATE of Treatment 2 compared to Treatment 1 for Moderates:", ate_t1_t2_mod, "\n")
+
+# Tech
+model_6_tech <- lm(avg_fav ~ treatment1 + treatment2 + gender + party, data = d[industry_tech=='Technology'])
+coeftest(model_6_tech, vcov = vcovHC(model_6_tech, type = "HC1"))
+coef_tech <- summary(model_6_tech)$coefficients
+ate_c_t1_tech <- coef_tech["treatment1", "Estimate"]
+ate_c_t2_tech <- coef_tech["treatment2", "Estimate"]
+ate_t1_t2_tech <- coef_tech["treatment2", "Estimate"] - coef_tech["treatment1", "Estimate"]
+cat("ATE of Treatment 1 compared to Control for Technology:", ate_c_t1_tech, "\n")
+cat("ATE of Treatment 2 compared to Control for Technology:", ate_c_t2_tech, "\n")
+cat("ATE of Treatment 2 compared to Treatment 1 for Technology:", ate_t1_t2_tech, "\n")
+```
+
+```{r stargazer with model 6 on age, results='asis'}
+# Robust standard errors
+se_6_18_34 <- sqrt(diag(vcovHC(model_6_18_34, type = "HC1")))
+se_6_35_49 <- sqrt(diag(vcovHC(model_6_35_49, type = "HC1")))
+se_6_50_64 <- sqrt(diag(vcovHC(model_6_50_64, type = "HC1")))
+se_6_65 <- sqrt(diag(vcovHC(model_6_65, type = "HC1")))
+
+
+# Stargazer
+stargazer(model_6_18_34, model_6_35_49, model_6_50_64, model_6_65,
+          se = list(se_6_18_34, se_6_35_49, se_6_50_64, se_6_65),
+          type = "text", 
+          title = "Regression Results by Age Group",
+          column.labels = c("18-34", "35-49", "50-64", "65+"),
+          dep.var.labels = "Average Favorability",
+          covariate.labels = c("Treatment 1", "Treatment 2"),
+          omit.stat = c("f", "ser"), # Omit F-statistic and Standard Error of Regression
+          star.cutoffs = c(0.05, 0.01, 0.001), # Custom significance levels
+          notes = "Robust standard errors are in parentheses.",
+          notes.align = "l",
+          digits = 3)
+```
+
+
+```{r hte using model 6 and interaction terms}
+mod_6_interactions <- lm(avg_fav ~ (treatment_group + age_group + gender + party + industry_tech)^2, data = d)
+
+#summary(mod_6_interactions)
+coefficients_summary <- summary(mod_6_interactions)$coefficients
+
+alpha <- 0.05
+significant_coefficients <- coefficients_summary[coefficients_summary[, "Pr(>|t|)"] < alpha, ]
+print(significant_coefficients)
+```
+
+## Statistical Testing
+
+```{r t-test}
+# Perform statistical tests to check for significance
+# Control vs Treatment 1 
+t_test_c_t1 <- t.test(avg_fav ~ treatment1, data = d_c_t1, paired = FALSE, na.action = na.omit)
+
+# Control vs Treatment 2
+t_test_c_t2 <- t.test(avg_fav ~ treatment2, data = d_c_t2, paired = FALSE, na.action = na.omit)
+
+# Treatment 1 vs Treatment 2
+t_test_t1_t2 <- t.test(avg_fav ~ treatment2, data = d_t1_t2, paired = FALSE, na.action = na.omit)
+
+# Print the results of the t-tests
+print(t_test_c_t1)
+print(t_test_c_t2)
+print(t_test_t1_t2)
+```
+
+```{r t-test across individuals}
+# Perform statistical tests to compare favorability for each individual across different groups
+
+# Biden
+t_test_biden_c_t1 <- t.test(avg_fav_biden ~ treatment1, data = d_c_t1, paired = FALSE, na.action = na.omit)
+t_test_biden_c_t2 <- t.test(avg_fav_biden ~ treatment2, data = d_c_t2, paired = FALSE, na.action = na.omit)
+t_test_biden_t1_t2 <- t.test(avg_fav_biden ~ treatment2, data = d_t1_t2, paired = FALSE, na.action = na.omit)
+
+# Trump
+t_test_trump_c_t1 <- t.test(avg_fav_trump ~ treatment1, data = d_c_t1, paired = FALSE, na.action = na.omit)
+t_test_trump_c_t2 <- t.test(avg_fav_trump ~ treatment2, data = d_c_t2, paired = FALSE, na.action = na.omit)
+t_test_trump_t1_t2 <- t.test(avg_fav_trump ~ treatment2, data = d_t1_t2, paired = FALSE, na.action = na.omit)
+
+# Zuckerberg
+t_test_zuck_c_t1 <- t.test(avg_fav_zuck ~ treatment1, data = d_c_t1, paired = FALSE, na.action = na.omit)
+t_test_zuck_c_t2 <- t.test(avg_fav_zuck ~ treatment2, data = d_c_t2, paired = FALSE, na.action = na.omit)
+t_test_zuck_t1_t2 <- t.test(avg_fav_zuck ~ treatment2, data = d_t1_t2, paired = FALSE, na.action = na.omit)
+
+# Musk
+t_test_musk_c_t1 <- t.test(avg_fav_musk ~ treatment1, data = d_c_t1, paired = FALSE, na.action = na.omit)
+t_test_musk_c_t2 <- t.test(avg_fav_musk ~ treatment2, data = d_c_t2, paired = FALSE, na.action = na.omit)
+t_test_musk_t1_t2 <- t.test(avg_fav_musk ~ treatment2, data = d_t1_t2, paired = FALSE, na.action = na.omit)
+
+# Print the results of the t-tests
+cat("Biden - Control vs Treatment 1\n")
+print(t_test_biden_c_t1)
+cat("\nBiden - Control vs Treatment 2\n")
+print(t_test_biden_c_t2)
+cat("\nBiden - Treatment 1 vs Treatment 2\n")
+print(t_test_biden_t1_t2)
+
+cat("\nTrump - Control vs Treatment 1\n")
+print(t_test_trump_c_t1)
+cat("\nTrump - Control vs Treatment 2\n")
+print(t_test_trump_c_t2)
+cat("\nTrump - Treatment 1 vs Treatment 2\n")
+print(t_test_trump_t1_t2)
+
+cat("\nZuckerberg - Control vs Treatment 1\n")
+print(t_test_zuck_c_t1)
+cat("\nZuckerberg - Control vs Treatment 2\n")
+print(t_test_zuck_c_t2)
+cat("\nZuckerberg - Treatment 1 vs Treatment 2\n")
+print(t_test_zuck_t1_t2)
+
+cat("\nMusk - Control vs Treatment 1\n")
+print(t_test_musk_c_t1)
+cat("\nMusk - Control vs Treatment 2\n")
+print(t_test_musk_c_t2)
+cat("\nMusk - Treatment 1 vs Treatment 2\n")
+print(t_test_musk_t1_t2)
+```
+
+
+```{r normality and Shapiro-Wilk test}
+# Check normality using Q-Q plots and Shapiro-Wilk test
+qqnorm(d$fav_biden_1, main = "Q-Q Plot for Control Biden")
+qqline(d$fav_biden_1)
+
+shapiro.test(d$fav_biden_1)
+```
+
+```{r Wilcoxon Rank Sum test}
+# Given non-normality, perform Wilcoxon Rank Sum test to compare average favorability
+wilcox_test_c_t1 <- wilcox.test(avg_fav ~ treatment1, data = d_c_t1, paired = FALSE, na.action = na.omit)
+wilcox_test_c_t2 <- wilcox.test(avg_fav ~ treatment2, data = d_c_t2, paired = FALSE, na.action = na.omit)
+wilcox_test_t1_t2 <- wilcox.test(avg_fav ~ treatment2, data = d_t1_t2, paired = FALSE, na.action = na.omit)
+
+cat("Control vs Treatment 1\n")
+print(wilcox_test_c_t1)
+
+cat("\nControl vs Treatment 2\n")
+print(wilcox_test_c_t2)
+
+cat("\nTreatment 1 vs Treatment 2\n")
+print(wilcox_test_t1_t2)
+```
+
+```{r Wilcoxon Rank Sum test across individuals}
+# Perform statistical tests to compare favorability for each individual across different groups
+
+# Biden
+wilcox_biden_c_t1 <- wilcox.test(avg_fav_biden ~ treatment1, data = d_c_t1, paired = FALSE, na.action = na.omit)
+wilcox_biden_c_t2 <- wilcox.test(avg_fav_biden ~ treatment2, data = d_c_t2, paired = FALSE, na.action = na.omit)
+wilcox_biden_t1_t2 <- wilcox.test(avg_fav_biden ~ treatment2, data = d_t1_t2, paired = FALSE, na.action = na.omit)
+
+# Trump
+wilcox_trump_c_t1 <- wilcox.test(avg_fav_trump ~ treatment1, data = d_c_t1, paired = FALSE, na.action = na.omit)
+wilcox_trump_c_t2 <- wilcox.test(avg_fav_trump ~ treatment2, data = d_c_t2, paired = FALSE, na.action = na.omit)
+wilcox_trump_t1_t2 <- wilcox.test(avg_fav_trump ~ treatment2, data = d_t1_t2, paired = FALSE, na.action = na.omit)
+
+# Zuckerberg
+wilcox_zuck_c_t1 <- wilcox.test(avg_fav_zuck ~ treatment1, data = d_c_t1, paired = FALSE, na.action = na.omit)
+wilcox_zuck_c_t2 <- wilcox.test(avg_fav_zuck ~ treatment2, data = d_c_t2, paired = FALSE, na.action = na.omit)
+wilcox_zuck_t1_t2 <- wilcox.test(avg_fav_zuck ~ treatment2, data = d_t1_t2, paired = FALSE, na.action = na.omit)
+
+# Musk
+wilcox_musk_c_t1 <- wilcox.test(avg_fav_musk ~ treatment1, data = d_c_t1, paired = FALSE, na.action = na.omit)
+wilcox_musk_c_t2 <- wilcox.test(avg_fav_musk ~ treatment2, data = d_c_t2, paired = FALSE, na.action = na.omit)
+wilcox_musk_t1_t2 <- wilcox.test(avg_fav_musk ~ treatment2, data = d_t1_t2, paired = FALSE, na.action = na.omit)
+
+# Print the results of the Wilcox tests
+cat("Biden - Control vs Treatment 1\n")
+print(wilcox_biden_c_t1)
+cat("\nBiden - Control vs Treatment 2\n")
+print(wilcox_biden_c_t2)
+cat("\nBiden - Treatment 1 vs Treatment 2\n")
+print(wilcox_biden_t1_t2)
+
+cat("\nTrump - Control vs Treatment 1\n")
+print(wilcox_trump_c_t1)
+cat("\nTrump - Control vs Treatment 2\n")
+print(wilcox_trump_c_t2)
+cat("\nTrump - Treatment 1 vs Treatment 2\n")
+print(wilcox_trump_t1_t2)
+
+cat("\nZuckerberg - Control vs Treatment 1\n")
+print(wilcox_zuck_c_t1)
+cat("\nZuckerberg - Control vs Treatment 2\n")
+print(wilcox_zuck_c_t2)
+cat("\nZuckerberg - Treatment 1 vs Treatment 2\n")
+print(wilcox_zuck_t1_t2)
+
+cat("\nMusk - Control vs Treatment 1\n")
+print(wilcox_musk_c_t1)
+cat("\nMusk - Control vs Treatment 2\n")
+print(wilcox_musk_c_t2)
+cat("\nMusk - Treatment 1 vs Treatment 2\n")
+print(wilcox_musk_t1_t2)
+```
+
+## Noncompliance 
+
+```{r noncompliance using survey duration}
+# Noncompliance: Assigned to T1 or T2 but have not watched the videos in its entirety
+# No other types of noncompliance is possible (e.g. assigned to control but watched video)
+compliance_duration <- 102 # videos are total 62 seconds long + 40 seconds for rest of survey
+noncompliers <- d[(treatment1 == 1 | treatment2 == 1) & `Duration (in seconds)` < compliance_duration, ]
+noncompliance_rate <- nrow(noncompliers) / nrow(d[(treatment1 == 1 | treatment2 == 1)])
+compliance_rate <- 1 - noncompliance_rate
+
+cat("There are", nrow(noncompliers), "noncompliers in the dataset, which is a noncompliance rate of", noncompliance_rate, "\n")
+cat("Compliance rate is", compliance_rate, "\n")
+
+cace_t1 <- ate_c_t1 / compliance_rate # compliance rate = takeup rate in our case b/c control group has no way of seeing the videos
+cat("CACE of Treatment 1 is", cace_t1, "\n")
+
+cace_t2 <- ate_c_t2 / compliance_rate 
+cat("CACE of Treatment 2 is", cace_t2)
+```
